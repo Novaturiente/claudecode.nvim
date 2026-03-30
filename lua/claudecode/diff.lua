@@ -1286,13 +1286,19 @@ function M._cleanup_diff_state(tab_name, reason)
     end
   elseif diff_data.inline_diff then
     -- Inline diff: no split windows to close, no diffoff needed.
-    -- Clear extmarks, then open the file from disk (which now has the new content if saved).
-    if diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
-      if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
+    -- Open the file from disk in the appropriate window.
+    if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
+      -- Prefer the neocode editor window if available, otherwise use target_window
+      local edit_win = nil
+      local neocode_win = vim.g.neocode_editor_win
+      if neocode_win and vim.api.nvim_win_is_valid(neocode_win) then
+        edit_win = neocode_win
+      elseif diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
+        edit_win = diff_data.target_window
+      end
+      if edit_win then
         pcall(function()
-          vim.api.nvim_set_current_win(diff_data.target_window)
-          -- Reload from disk: if accepted, Claude CLI already wrote the new content
-          -- If rejected, the file on disk is unchanged (original content)
+          vim.api.nvim_set_current_win(edit_win)
           vim.cmd("edit! " .. vim.fn.fnameescape(diff_data.old_file_path))
         end)
       end
