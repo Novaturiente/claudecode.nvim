@@ -483,110 +483,104 @@ end
 
 ---Set up highlight groups for inline diff display
 local function setup_inline_highlights()
-  -- Added lines: green background (force override colorscheme)
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineAdd", { bg = "#1e3a1e", fg = "#a8d8a8" })
-  -- Deleted lines: red with strikethrough (shown as virtual text)
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineDel", { bg = "#3a1a1a", fg = "#e06c75", strikethrough = true })
-  -- Changed lines (new version): green-ish background
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineChange", { bg = "#1e3a1e", fg = "#a8d8a8" })
-  -- Sign column markers
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineAdd", { bg = "#1e3a1e" })
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineDel", { bg = "#3a1a1a", strikethrough = true })
   vim.api.nvim_set_hl(0, "ClaudeCodeSignAdd", { fg = "#a8d8a8", bold = true })
   vim.api.nvim_set_hl(0, "ClaudeCodeSignDel", { fg = "#e06c75", bold = true })
-  vim.api.nvim_set_hl(0, "ClaudeCodeSignChange", { fg = "#e5c07b", bold = true })
 end
 
 ---Compute a simple line-level diff between old and new content using vim.diff
----Returns a list of hunks: {old_start, old_count, new_start, new_count}
 ---@param old_text string
 ---@param new_text string
----@return table[] hunks
+---@return table[] hunks list of {old_start, old_count, new_start, new_count}
 local function compute_hunks(old_text, new_text)
-  local diff_result = vim.diff(old_text, new_text, { result_type = "indices" })
-  -- diff_result is a list of {old_start, old_count, new_start, new_count}
-  return diff_result or {}
+  return vim.diff(old_text, new_text, { result_type = "indices" }) or {}
 end
 
----Apply inline diff decorations to a buffer showing the new content
----Deleted lines are shown as virtual text above the corresponding position
----Added/changed lines get a background highlight
----@param buf number Buffer containing the NEW content
----@param old_lines string[] Lines of the old file
----@param new_lines string[] Lines of the new file
----@param hunks table[] Diff hunks from compute_hunks
-local function apply_inline_decorations(buf, old_lines, new_lines, hunks)
-  setup_inline_highlights()
-  vim.api.nvim_buf_clear_namespace(buf, inline_ns, 0, -1)
+---Build a merged buffer with old (deleted) and new (added) lines interleaved.
+---Returns the merged lines and a map tracking line types.
+---@param old_lines string[]
+---@param new_lines string[]
+---@param hunks table[]
+---@return string[] merged_lines
+---@return string[] line_types each entry is "keep", "del", or "add"
+local function build_merged_lines(old_lines, new_lines, hunks)
+  local merged = {}
+  local types = {}
+  local old_pos = 1 -- current position in old_lines
+  local new_pos = 1 -- current position in new_lines
 
   for _, hunk in ipairs(hunks) do
     local old_start, old_count, new_start, new_count = hunk[1], hunk[2], hunk[3], hunk[4]
 
-    -- Show deleted lines as virtual text above the insertion point
-    if old_count > 0 then
-      local virt_lines = {}
-      for i = old_start, old_start + old_count - 1 do
-        local line_text = old_lines[i] or ""
-        -- Full-width red line with - prefix and strikethrough
-        table.insert(virt_lines, { { "  - " .. line_text, "ClaudeCodeInlineDel" } })
-      end
+    -- Add unchanged lines before this hunk (from new_lines since they match old)
+    while new_pos < new_start do
+      merged[#merged + 1] = new_lines[new_pos]
+      types[#types + 1] = "keep"
+      new_pos = new_pos + 1
+      old_pos = old_pos + 1
+    end
 
-      -- Place virtual lines above the new_start position
-      local anchor_line = new_start - 1 -- 0-indexed
-      if new_count == 0 then
-        -- Pure deletion: anchor at the line after the deletion point
-        anchor_line = math.min(new_start, #new_lines) - 1
-        if anchor_line < 0 then
-          anchor_line = 0
-        end
-      end
+    -- Add deleted lines from old (shown in red)
+    for i = old_start, old_start + old_count - 1 do
+      merged[#merged + 1] = old_lines[i] or ""
+      types[#types + 1] = "del"
+    end
+    old_pos = old_start + old_count
 
-      pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, anchor_line, 0, {
-        virt_lines = virt_lines,
-        virt_lines_above = true,
+    -- Add added/changed lines from new (shown in green)
+    for i = new_start, new_start + new_count - 1 do
+      merged[#merged + 1] = new_lines[i] or ""
+      types[#types + 1] = "add"
+    end
+    new_pos = new_start + new_count
+  end
+
+  -- Add remaining unchanged lines after the last hunk
+  while new_pos <= #new_lines do
+    merged[#merged + 1] = new_lines[new_pos]
+    types[#types + 1] = "keep"
+    new_pos = new_pos + 1
+  end
+
+  return merged, types
+end
+
+---Apply highlights and signs to the merged buffer
+---@param buf number
+---@param line_types string[]
+local function apply_merged_decorations(buf, line_types)
+  setup_inline_highlights()
+  vim.api.nvim_buf_clear_namespace(buf, inline_ns, 0, -1)
+
+  for i, ltype in ipairs(line_types) do
+    local line_idx = i - 1 -- 0-indexed
+    if ltype == "del" then
+      pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, line_idx, 0, {
+        line_hl_group = "ClaudeCodeInlineDel",
+        sign_text = "-",
+        sign_hl_group = "ClaudeCodeSignDel",
       })
-    end
-
-    -- Highlight added/changed lines with background + sign in gutter
-    if new_count > 0 then
-      local hl_group = old_count > 0 and "ClaudeCodeInlineChange" or "ClaudeCodeInlineAdd"
-      local sign_hl = old_count > 0 and "ClaudeCodeSignChange" or "ClaudeCodeSignAdd"
-      local sign_char = old_count > 0 and "~" or "+"
-      for i = new_start, new_start + new_count - 1 do
-        local line_idx = i - 1 -- 0-indexed
-        if line_idx >= 0 and line_idx < #new_lines then
-          pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, line_idx, 0, {
-            line_hl_group = hl_group,
-            sign_text = sign_char,
-            sign_hl_group = sign_hl,
-          })
-        end
-      end
-    end
-
-    -- Also add - sign markers for pure deletions (no replacement lines)
-    if old_count > 0 and new_count == 0 then
-      local anchor_line = math.min(new_start, #new_lines) - 1
-      if anchor_line < 0 then
-        anchor_line = 0
-      end
-      if anchor_line < #new_lines then
-        pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, anchor_line, 0, {
-          sign_text = "-",
-          sign_hl_group = "ClaudeCodeSignDel",
-        })
-      end
+    elseif ltype == "add" then
+      pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, line_idx, 0, {
+        line_hl_group = "ClaudeCodeInlineAdd",
+        sign_text = "+",
+        sign_hl_group = "ClaudeCodeSignAdd",
+      })
     end
   end
 end
 
----Create an inline diff view in a single buffer (VS Code style)
----@param target_window NvimWin|nil The window to display the inline diff in
----@param old_file_path string Path to the original file
----@param new_buffer NvimBuf Buffer containing new content
----@param tab_name string The diff identifier
----@param is_new_file boolean Whether the old file doesn't exist yet
----@param terminal_win_in_new_tab NvimWin|nil Terminal window in new tab if created
----@param existing_buffer NvimBuf|nil Existing buffer for the file if already loaded
----@return DiffLayoutInfo layout Info about the created inline diff layout
+---Create an inline diff view using a merged buffer (VS Code style)
+---Old deleted lines (red) and new added lines (green) shown in the same buffer.
+---@param target_window NvimWin|nil
+---@param old_file_path string
+---@param new_buffer NvimBuf Buffer containing new content (will be repurposed)
+---@param tab_name string
+---@param is_new_file boolean
+---@param terminal_win_in_new_tab NvimWin|nil
+---@param existing_buffer NvimBuf|nil
+---@return DiffLayoutInfo
 local function create_inline_diff_view(
   target_window,
   old_file_path,
@@ -596,22 +590,19 @@ local function create_inline_diff_view(
   terminal_win_in_new_tab,
   existing_buffer
 )
-  -- Find or create the target window (same logic as split mode but no second pane)
+  -- Find or create the target window
   if not target_window then
     if terminal_win_in_new_tab then
       target_window = vim.api.nvim_get_current_win()
     else
       vim.cmd("wincmd t")
       vim.cmd("wincmd l")
-
       local buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
       local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
       local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
-
-      if buftype == "terminal" or buftype == "prompt" or filetype == "neo-tree" or filetype == "snacks_picker_list" then
+      if buftype == "terminal" or buftype == "prompt" or filetype == "neo-tree" or filetype == "NvimTree" or filetype == "snacks_picker_list" then
         create_split()
       end
-
       target_window = vim.api.nvim_get_current_win()
     end
   else
@@ -624,10 +615,22 @@ local function create_inline_diff_view(
     old_lines = vim.fn.readfile(old_file_path)
   end
 
-  -- Get new content from buffer
+  -- Get new content from buffer (the proposed changes)
   local new_lines = vim.api.nvim_buf_get_lines(new_buffer, 0, -1, false)
 
-  -- Show the new buffer in the target window (single pane)
+  -- Compute diff
+  local old_text = (#old_lines > 0) and (table.concat(old_lines, "\n") .. "\n") or ""
+  local new_text = (#new_lines > 0) and (table.concat(new_lines, "\n") .. "\n") or ""
+  local hunks = compute_hunks(old_text, new_text)
+
+  -- Build merged buffer: deleted lines (red) then added lines (green), interleaved
+  local merged_lines, line_types = build_merged_lines(old_lines, new_lines, hunks)
+
+  -- Replace new_buffer content with the merged view
+  vim.api.nvim_buf_set_option(new_buffer, "modifiable", true)
+  vim.api.nvim_buf_set_lines(new_buffer, 0, -1, false, merged_lines)
+
+  -- Show the buffer in the target window
   vim.api.nvim_win_set_buf(target_window, new_buffer)
 
   -- Apply filetype for syntax highlighting
@@ -636,17 +639,18 @@ local function create_inline_diff_view(
     vim.api.nvim_set_option_value("filetype", ft, { buf = new_buffer })
   end
 
-  -- Compute diff and apply inline decorations
-  local old_text = table.concat(old_lines, "\n") .. "\n"
-  local new_text = table.concat(new_lines, "\n") .. "\n"
-  local hunks = compute_hunks(old_text, new_text)
-  apply_inline_decorations(new_buffer, old_lines, new_lines, hunks)
+  -- Apply diff decorations (red/green highlights + signs)
+  apply_merged_decorations(new_buffer, line_types)
 
-  -- Set buffer variables for accept/reject
+  -- Store line_types on the buffer so BufWriteCmd can extract only new content
+  vim.b[new_buffer].claudecode_inline_line_types = line_types
   vim.b[new_buffer].claudecode_diff_tab_name = tab_name
   vim.b[new_buffer].claudecode_diff_new_win = target_window
   vim.b[new_buffer].claudecode_diff_target_win = target_window
   vim.b[new_buffer].claudecode_inline_diff = true
+
+  -- Make buffer read-only so user doesn't accidentally edit the merged view
+  vim.api.nvim_buf_set_option(new_buffer, "modifiable", false)
 
   -- Handle terminal focus
   if config and config.diff_opts and config.diff_opts.keep_terminal_focus then
@@ -656,7 +660,6 @@ local function create_inline_diff_view(
         vim.cmd("startinsert")
         return
       end
-
       local terminal_win = find_claudecode_terminal_window()
       if terminal_win then
         vim.api.nvim_set_current_win(terminal_win)
@@ -666,7 +669,7 @@ local function create_inline_diff_view(
   end
 
   return {
-    new_window = target_window, -- In inline mode, same window for both
+    new_window = target_window,
     target_window = target_window,
     target_window_created_by_plugin = false,
     original_buffer = existing_buffer,
@@ -935,8 +938,21 @@ function M._resolve_diff_as_saved(tab_name, buffer_id)
 
   logger.debug("diff", "Accepting diff for", tab_name)
 
-  -- Get content from buffer
-  local content_lines = vim.api.nvim_buf_get_lines(buffer_id, 0, -1, false)
+  -- Get content from buffer — for inline diffs, filter out deleted lines
+  local content_lines
+  local line_types = vim.b[buffer_id].claudecode_inline_line_types
+  if line_types then
+    -- Inline merged view: extract only "keep" and "add" lines (skip "del")
+    local all_lines = vim.api.nvim_buf_get_lines(buffer_id, 0, -1, false)
+    content_lines = {}
+    for i, ltype in ipairs(line_types) do
+      if ltype ~= "del" then
+        content_lines[#content_lines + 1] = all_lines[i]
+      end
+    end
+  else
+    content_lines = vim.api.nvim_buf_get_lines(buffer_id, 0, -1, false)
+  end
   local final_content = table.concat(content_lines, "\n")
   -- Add trailing newline if the buffer has one
   if #content_lines > 0 and vim.api.nvim_buf_get_option(buffer_id, "eol") then
