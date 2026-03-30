@@ -4,6 +4,9 @@ local M = {}
 
 local logger = require("claudecode.logger")
 
+-- Namespace for inline diff extmarks
+local inline_ns = vim.api.nvim_create_namespace("claudecode_inline_diff")
+
 -- Window options for terminal display (internal type, not exposed in public API)
 ---@class WindowOptions
 ---@field number boolean Show line numbers
@@ -131,6 +134,183 @@ local function create_split()
     vim.cmd("rightbelow vsplit")
   end
 end
+
+-- ============================================================================
+-- INLINE DIFF RENDERING
+-- ============================================================================
+
+---Set up highlight groups for inline diff display
+local function setup_inline_highlights()
+  -- Added lines: green background
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineAdd", { bg = "#1a3a1a", default = true })
+  -- Deleted lines: red background (shown as virtual text)
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineDel", { bg = "#3a1a1a", fg = "#cc6666", default = true })
+  -- Changed lines: subtle blue background
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineChange", { bg = "#1a2a3a", default = true })
+end
+
+---Compute a simple line-level diff between old and new content using vim.diff
+---Returns a list of hunks: {old_start, old_count, new_start, new_count}
+---@param old_text string
+---@param new_text string
+---@return table[] hunks
+local function compute_hunks(old_text, new_text)
+  local diff_result = vim.diff(old_text, new_text, { result_type = "indices" })
+  -- diff_result is a list of {old_start, old_count, new_start, new_count}
+  return diff_result or {}
+end
+
+---Apply inline diff decorations to a buffer showing the new content
+---Deleted lines are shown as virtual text above the corresponding position
+---Added/changed lines get a background highlight
+---@param buf number Buffer containing the NEW content
+---@param old_lines string[] Lines of the old file
+---@param new_lines string[] Lines of the new file
+---@param hunks table[] Diff hunks from compute_hunks
+local function apply_inline_decorations(buf, old_lines, new_lines, hunks)
+  setup_inline_highlights()
+  vim.api.nvim_buf_clear_namespace(buf, inline_ns, 0, -1)
+
+  for _, hunk in ipairs(hunks) do
+    local old_start, old_count, new_start, new_count = hunk[1], hunk[2], hunk[3], hunk[4]
+
+    -- Show deleted lines as virtual text above the insertion point
+    if old_count > 0 then
+      local virt_lines = {}
+      for i = old_start, old_start + old_count - 1 do
+        local line_text = old_lines[i] or ""
+        table.insert(virt_lines, { { "- " .. line_text, "ClaudeCodeInlineDel" } })
+      end
+
+      -- Place virtual lines above the new_start position
+      -- If new_count > 0, place above the first new line; otherwise above the next existing line
+      local anchor_line = new_start - 1 -- 0-indexed
+      if new_count == 0 then
+        -- Pure deletion: anchor at the line after the deletion point
+        anchor_line = math.min(new_start, #new_lines) - 1
+        if anchor_line < 0 then
+          anchor_line = 0
+        end
+      end
+
+      pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, anchor_line, 0, {
+        virt_lines = virt_lines,
+        virt_lines_above = true,
+      })
+    end
+
+    -- Highlight added/changed lines in the new content
+    if new_count > 0 then
+      local hl_group = old_count > 0 and "ClaudeCodeInlineChange" or "ClaudeCodeInlineAdd"
+      for i = new_start, new_start + new_count - 1 do
+        local line_idx = i - 1 -- 0-indexed
+        if line_idx >= 0 and line_idx < #new_lines then
+          pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, line_idx, 0, {
+            line_hl_group = hl_group,
+          })
+        end
+      end
+    end
+  end
+end
+
+---Create an inline diff view in a single buffer (VS Code style)
+---@param target_window NvimWin|nil The window to display the inline diff in
+---@param old_file_path string Path to the original file
+---@param new_buffer NvimBuf Buffer containing new content
+---@param tab_name string The diff identifier
+---@param is_new_file boolean Whether the old file doesn't exist yet
+---@param terminal_win_in_new_tab NvimWin|nil Terminal window in new tab if created
+---@param existing_buffer NvimBuf|nil Existing buffer for the file if already loaded
+---@return DiffLayoutInfo layout Info about the created inline diff layout
+local function create_inline_diff_view(
+  target_window,
+  old_file_path,
+  new_buffer,
+  tab_name,
+  is_new_file,
+  terminal_win_in_new_tab,
+  existing_buffer
+)
+  -- Find or create the target window (same logic as split mode but no second pane)
+  if not target_window then
+    if terminal_win_in_new_tab then
+      target_window = vim.api.nvim_get_current_win()
+    else
+      vim.cmd("wincmd t")
+      vim.cmd("wincmd l")
+
+      local buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+      local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
+      local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
+
+      if buftype == "terminal" or buftype == "prompt" or filetype == "neo-tree" or filetype == "snacks_picker_list" then
+        create_split()
+      end
+
+      target_window = vim.api.nvim_get_current_win()
+    end
+  else
+    vim.api.nvim_set_current_win(target_window)
+  end
+
+  -- Read old file content
+  local old_lines = {}
+  if not is_new_file and vim.fn.filereadable(old_file_path) == 1 then
+    old_lines = vim.fn.readfile(old_file_path)
+  end
+
+  -- Get new content from buffer
+  local new_lines = vim.api.nvim_buf_get_lines(new_buffer, 0, -1, false)
+
+  -- Show the new buffer in the target window (single pane)
+  vim.api.nvim_win_set_buf(target_window, new_buffer)
+
+  -- Apply filetype for syntax highlighting
+  local ft = detect_filetype(old_file_path, existing_buffer)
+  if ft and ft ~= "" then
+    vim.api.nvim_set_option_value("filetype", ft, { buf = new_buffer })
+  end
+
+  -- Compute diff and apply inline decorations
+  local old_text = table.concat(old_lines, "\n") .. "\n"
+  local new_text = table.concat(new_lines, "\n") .. "\n"
+  local hunks = compute_hunks(old_text, new_text)
+  apply_inline_decorations(new_buffer, old_lines, new_lines, hunks)
+
+  -- Set buffer variables for accept/reject
+  vim.b[new_buffer].claudecode_diff_tab_name = tab_name
+  vim.b[new_buffer].claudecode_diff_new_win = target_window
+  vim.b[new_buffer].claudecode_diff_target_win = target_window
+  vim.b[new_buffer].claudecode_inline_diff = true
+
+  -- Handle terminal focus
+  if config and config.diff_opts and config.diff_opts.keep_terminal_focus then
+    vim.schedule(function()
+      if terminal_win_in_new_tab and vim.api.nvim_win_is_valid(terminal_win_in_new_tab) then
+        vim.api.nvim_set_current_win(terminal_win_in_new_tab)
+        vim.cmd("startinsert")
+        return
+      end
+
+      local terminal_win = find_claudecode_terminal_window()
+      if terminal_win then
+        vim.api.nvim_set_current_win(terminal_win)
+        vim.cmd("startinsert")
+      end
+    end)
+  end
+
+  return {
+    new_window = target_window, -- In inline mode, same window for both
+    target_window = target_window,
+    target_window_created_by_plugin = false,
+    original_buffer = existing_buffer,
+    original_buffer_created_by_plugin = false,
+  }
+end
+
+-- ============================================================================
 
 ---Capture window-local options from a window
 ---@param win_id number Window ID to capture options from
@@ -916,6 +1096,19 @@ function M._create_diff_view_from_window(
   terminal_win_in_new_tab,
   existing_buffer
 )
+  -- Route to inline diff if configured
+  if config and config.diff_opts and config.diff_opts.layout == "inline" then
+    return create_inline_diff_view(
+      target_window,
+      old_file_path,
+      new_buffer,
+      tab_name,
+      is_new_file,
+      terminal_win_in_new_tab,
+      existing_buffer
+    )
+  end
+
   local original_buffer_created_by_plugin = false
   local target_window_created_by_plugin = false
 
@@ -1003,6 +1196,11 @@ function M._cleanup_diff_state(tab_name, reason)
     pcall(vim.api.nvim_del_autocmd, autocmd_id)
   end
 
+  -- Clean up inline diff extmarks if this was an inline diff
+  if diff_data.inline_diff and diff_data.new_buffer and vim.api.nvim_buf_is_valid(diff_data.new_buffer) then
+    pcall(vim.api.nvim_buf_clear_namespace, diff_data.new_buffer, inline_ns, 0, -1)
+  end
+
   -- Clean up new tab if we created one (do this first to avoid double cleanup)
   if diff_data.created_new_tab then
     -- Always switch to the original tab first (if valid)
@@ -1045,6 +1243,27 @@ function M._cleanup_diff_state(tab_name, reason)
           local terminal_width = math.floor(total_width * split_width)
           pcall(vim.api.nvim_win_set_width, terminal_win, terminal_width)
         end
+      end
+    end
+  elseif diff_data.inline_diff then
+    -- Inline diff: no split windows to close, no diffoff needed.
+    -- Just reload the original file in the window if the diff was saved.
+    -- The buffer cleanup below handles deleting the proposed buffer.
+    if diff_data.status == "saved" and diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
+      -- Load the original file back into the window
+      if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
+        pcall(function()
+          vim.api.nvim_set_current_win(diff_data.target_window)
+          vim.cmd("edit " .. vim.fn.fnameescape(diff_data.old_file_path))
+        end)
+      end
+    elseif diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
+      -- Rejected: restore the original file
+      if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
+        pcall(function()
+          vim.api.nvim_set_current_win(diff_data.target_window)
+          vim.cmd("edit " .. vim.fn.fnameescape(diff_data.old_file_path))
+        end)
       end
     end
   else
@@ -1257,6 +1476,7 @@ function M._setup_blocking_diff(params, resolution_callback)
       resolution_callback = resolution_callback,
       result_content = nil,
       is_new_file = is_new_file,
+      inline_diff = config and config.diff_opts and config.diff_opts.layout == "inline",
     })
   end) -- End of pcall
 
