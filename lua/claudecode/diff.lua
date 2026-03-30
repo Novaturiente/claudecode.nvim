@@ -483,12 +483,16 @@ end
 
 ---Set up highlight groups for inline diff display
 local function setup_inline_highlights()
-  -- Added lines: green background
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineAdd", { bg = "#1a3a1a", default = true })
-  -- Deleted lines: red background (shown as virtual text)
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineDel", { bg = "#3a1a1a", fg = "#cc6666", default = true })
-  -- Changed lines: subtle blue background
-  vim.api.nvim_set_hl(0, "ClaudeCodeInlineChange", { bg = "#1a2a3a", default = true })
+  -- Added lines: green background (force override colorscheme)
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineAdd", { bg = "#1e3a1e", fg = "#a8d8a8" })
+  -- Deleted lines: red with strikethrough (shown as virtual text)
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineDel", { bg = "#3a1a1a", fg = "#e06c75", strikethrough = true })
+  -- Changed lines (new version): green-ish background
+  vim.api.nvim_set_hl(0, "ClaudeCodeInlineChange", { bg = "#1e3a1e", fg = "#a8d8a8" })
+  -- Sign column markers
+  vim.api.nvim_set_hl(0, "ClaudeCodeSignAdd", { fg = "#a8d8a8", bold = true })
+  vim.api.nvim_set_hl(0, "ClaudeCodeSignDel", { fg = "#e06c75", bold = true })
+  vim.api.nvim_set_hl(0, "ClaudeCodeSignChange", { fg = "#e5c07b", bold = true })
 end
 
 ---Compute a simple line-level diff between old and new content using vim.diff
@@ -521,11 +525,11 @@ local function apply_inline_decorations(buf, old_lines, new_lines, hunks)
       local virt_lines = {}
       for i = old_start, old_start + old_count - 1 do
         local line_text = old_lines[i] or ""
-        table.insert(virt_lines, { { "- " .. line_text, "ClaudeCodeInlineDel" } })
+        -- Full-width red line with - prefix and strikethrough
+        table.insert(virt_lines, { { "  - " .. line_text, "ClaudeCodeInlineDel" } })
       end
 
       -- Place virtual lines above the new_start position
-      -- If new_count > 0, place above the first new line; otherwise above the next existing line
       local anchor_line = new_start - 1 -- 0-indexed
       if new_count == 0 then
         -- Pure deletion: anchor at the line after the deletion point
@@ -541,16 +545,34 @@ local function apply_inline_decorations(buf, old_lines, new_lines, hunks)
       })
     end
 
-    -- Highlight added/changed lines in the new content
+    -- Highlight added/changed lines with background + sign in gutter
     if new_count > 0 then
       local hl_group = old_count > 0 and "ClaudeCodeInlineChange" or "ClaudeCodeInlineAdd"
+      local sign_hl = old_count > 0 and "ClaudeCodeSignChange" or "ClaudeCodeSignAdd"
+      local sign_char = old_count > 0 and "~" or "+"
       for i = new_start, new_start + new_count - 1 do
         local line_idx = i - 1 -- 0-indexed
         if line_idx >= 0 and line_idx < #new_lines then
           pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, line_idx, 0, {
             line_hl_group = hl_group,
+            sign_text = sign_char,
+            sign_hl_group = sign_hl,
           })
         end
+      end
+    end
+
+    -- Also add - sign markers for pure deletions (no replacement lines)
+    if old_count > 0 and new_count == 0 then
+      local anchor_line = math.min(new_start, #new_lines) - 1
+      if anchor_line < 0 then
+        anchor_line = 0
+      end
+      if anchor_line < #new_lines then
+        pcall(vim.api.nvim_buf_set_extmark, buf, inline_ns, anchor_line, 0, {
+          sign_text = "-",
+          sign_hl_group = "ClaudeCodeSignDel",
+        })
       end
     end
   end
@@ -618,7 +640,6 @@ local function create_inline_diff_view(
   local old_text = table.concat(old_lines, "\n") .. "\n"
   local new_text = table.concat(new_lines, "\n") .. "\n"
   local hunks = compute_hunks(old_text, new_text)
-  vim.notify("[ClaudeCode] Inline diff: " .. #hunks .. " hunks, " .. #old_lines .. " old / " .. #new_lines .. " new lines", vim.log.levels.INFO)
   apply_inline_decorations(new_buffer, old_lines, new_lines, hunks)
 
   -- Set buffer variables for accept/reject
@@ -1249,22 +1270,14 @@ function M._cleanup_diff_state(tab_name, reason)
     end
   elseif diff_data.inline_diff then
     -- Inline diff: no split windows to close, no diffoff needed.
-    -- Just reload the original file in the window if the diff was saved.
-    -- The buffer cleanup below handles deleting the proposed buffer.
-    if diff_data.status == "saved" and diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
-      -- Load the original file back into the window
+    -- Clear extmarks, then open the file from disk (which now has the new content if saved).
+    if diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
       if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
         pcall(function()
           vim.api.nvim_set_current_win(diff_data.target_window)
-          vim.cmd("edit " .. vim.fn.fnameescape(diff_data.old_file_path))
-        end)
-      end
-    elseif diff_data.target_window and vim.api.nvim_win_is_valid(diff_data.target_window) then
-      -- Rejected: restore the original file
-      if diff_data.old_file_path and vim.fn.filereadable(diff_data.old_file_path) == 1 then
-        pcall(function()
-          vim.api.nvim_set_current_win(diff_data.target_window)
-          vim.cmd("edit " .. vim.fn.fnameescape(diff_data.old_file_path))
+          -- Reload from disk: if accepted, Claude CLI already wrote the new content
+          -- If rejected, the file on disk is unchanged (original content)
+          vim.cmd("edit! " .. vim.fn.fnameescape(diff_data.old_file_path))
         end)
       end
     end
