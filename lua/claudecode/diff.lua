@@ -618,6 +618,7 @@ local function create_inline_diff_view(
   local old_text = table.concat(old_lines, "\n") .. "\n"
   local new_text = table.concat(new_lines, "\n") .. "\n"
   local hunks = compute_hunks(old_text, new_text)
+  vim.notify("[ClaudeCode] Inline diff: " .. #hunks .. " hunks, " .. #old_lines .. " old / " .. #new_lines .. " new lines", vim.log.levels.INFO)
   apply_inline_decorations(new_buffer, old_lines, new_lines, hunks)
 
   -- Set buffer variables for accept/reject
@@ -1098,6 +1099,7 @@ function M._create_diff_view_from_window(
 )
   -- Route to inline diff if configured
   if config and config.diff_opts and config.diff_opts.layout == "inline" then
+    logger.debug("diff", "Routing to inline diff view for", tab_name)
     return create_inline_diff_view(
       target_window,
       old_file_path,
